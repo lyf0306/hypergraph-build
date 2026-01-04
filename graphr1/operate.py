@@ -102,7 +102,7 @@ async def _handle_single_entity_extraction(
     
     # [关键修改] 提取 Role 字段 (索引 4)
     raw_role = clean_str(record_attributes[4].upper()).replace('"', '').replace("'", "").strip()
-    print(f"DEBUG ROLE: Raw='{raw_role}' | Original List={record_attributes}")
+    #print(f"DEBUG ROLE: Raw='{raw_role}' | Original List={record_attributes}")
     
     # [关键修改] 角色白名单映射 (容错处理)
     ROLE_MAPPING = {
@@ -332,6 +332,8 @@ async def _merge_edges_then_upsert(
     return edge_data
 
 # 修改点：新增 paper_name 参数，用于关联文献节点
+# graphr1/operate.py 中的 extract_entities 函数
+
 async def extract_entities(
     chunks: dict[str, TextChunkSchema],
     knowledge_graph_inst: BaseGraphStorage,
@@ -483,52 +485,82 @@ async def extract_entities(
         for k, v in m_edges.items():
             maybe_edges[k].extend(v)
 
-    # 在执行插入超边的循环处，将 paper_name 传进去
+
+    # ==========================
+    # 关键修改：加入信号量并发控制
+    # ==========================
+    
+    # 限制并发数为 30 (可根据数据库实际承受能力调整，20-50通常较安全)
+    write_concurrency_limit = asyncio.Semaphore(30)
+
+    # 定义带信号量的任务包装器
+    async def _sem_task(coro):
+        async with write_concurrency_limit:
+            return await coro
+
+    # 1. 插入超边 (Hyperedges)
     logger.info("Inserting hyperedges into storage...")
     all_hyperedges_data = []
+    
+    # 使用 _sem_task 包裹任务
+    tasks = [
+        _sem_task(_merge_hyperedges_then_upsert(
+            k, v, knowledge_graph_inst, global_config, paper_name=paper_name
+        ))
+        for k, v in maybe_edges.items()
+    ]
+    
     for result in tqdm_async(
-        asyncio.as_completed(
-            [
-                _merge_hyperedges_then_upsert(k, v, knowledge_graph_inst, global_config
-                    , paper_name=paper_name) # 传入 新增：paper_name 参数
-                for k, v in maybe_edges.items()
-            ]
-        ),
+        asyncio.as_completed(tasks),
         total=len(maybe_edges),
         desc="Inserting hyperedges",
         unit="entity",
     ):
         all_hyperedges_data.append(await result)
             
+    # 2. 插入实体 (Entities)
     logger.info("Inserting entities into storage...")
     all_entities_data = []
+
+    # 使用 _sem_task 包裹任务
+    tasks = [
+        _sem_task(_merge_nodes_then_upsert(
+            k, v, knowledge_graph_inst, global_config
+        ))
+        for k, v in maybe_nodes.items()
+    ]
+    
     for result in tqdm_async(
-        asyncio.as_completed(
-            [
-                _merge_nodes_then_upsert(k, v, knowledge_graph_inst, global_config)
-                for k, v in maybe_nodes.items()
-            ]
-        ),
+        asyncio.as_completed(tasks),
         total=len(maybe_nodes),
         desc="Inserting entities",
         unit="entity",
     ):
         all_entities_data.append(await result)
 
+    # 3. 插入关系 (Relationships)
     logger.info("Inserting relationships into storage...")
     all_relationships_data = []
+
+    # 使用 _sem_task 包裹任务
+    tasks = [
+        _sem_task(_merge_edges_then_upsert(
+            k, v, knowledge_graph_inst, global_config
+        ))
+        for k, v in maybe_nodes.items()
+    ]
+
     for result in tqdm_async(
-        asyncio.as_completed(
-            [
-                _merge_edges_then_upsert(k, v, knowledge_graph_inst, global_config)
-                for k, v in maybe_nodes.items()
-            ]
-        ),
+        asyncio.as_completed(tasks),
         total=len(maybe_nodes),
         desc="Inserting relationships",
         unit="relationship",
     ):
         all_relationships_data.append(await result)
+
+    # ==========================
+    # 结束并发控制修改区域
+    # ==========================
 
     if not len(all_hyperedges_data) and not len(all_entities_data) and not len(all_relationships_data):
         logger.warning(
@@ -564,7 +596,6 @@ async def extract_entities(
         await entity_vdb.upsert(data_for_vdb)
 
     return knowledge_graph_inst
-
 
 async def kg_query(
     query,
